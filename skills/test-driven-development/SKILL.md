@@ -38,9 +38,29 @@ Write the test first. It must fail. A test that passes immediately proves nothin
 
 ```typescript
 // RED: This test fails because createTask doesn't exist yet
+import { Test, TestingModule } from '@nestjs/testing';
+import { TaskService } from './task.service';
+import { MikroORM } from '@mikro-orm/core';
+
 describe('TaskService', () => {
+  let service: TaskService;
+  let orm: MikroORM;
+
+  beforeEach(async () => {
+    // Use in-memory SQLite for fast unit tests
+    const module: TestingModule = await Test.createTestingModule({
+      providers: [TaskService],
+    }).useMocker((token) => {
+      if (token === MikroORM) {
+        return { /* mock ORM */ };
+      }
+    }).compile();
+
+    service = module.get<TaskService>(TaskService);
+  });
+
   it('creates a task with title and default status', async () => {
-    const task = await taskService.createTask({ title: 'Buy groceries' });
+    const task = await service.createTask({ title: 'Buy groceries' });
 
     expect(task.id).toBeDefined();
     expect(task.title).toBe('Buy groceries');
@@ -55,16 +75,28 @@ describe('TaskService', () => {
 Write the minimum code to make the test pass. Don't over-engineer:
 
 ```typescript
-// GREEN: Minimal implementation
-export async function createTask(input: { title: string }): Promise<Task> {
-  const task = {
-    id: generateId(),
-    title: input.title,
-    status: 'pending' as const,
-    createdAt: new Date(),
-  };
-  await db.tasks.insert(task);
-  return task;
+// task.service.ts - NestJS service with MikroORM
+import { Injectable } from '@nestjs/common';
+import { InjectRepository } from '@mikro-orm/nestjs';
+import { EntityRepository } from '@mikro-orm/core';
+import { Task } from './task.entity';
+
+@Injectable()
+export class TaskService {
+  constructor(
+    @InjectRepository(Task)
+    private readonly taskRepo: EntityRepository<Task>,
+  ) {}
+
+  async createTask(input: { title: string }): Promise<Task> {
+    const task = this.taskRepo.create({
+      title: input.title,
+      status: 'pending',
+      createdAt: new Date(),
+    });
+    await this.taskRepo.flush();
+    return task;
+  }
 }
 ```
 
@@ -116,12 +148,13 @@ it('sets completedAt when task is completed', async () => {
   expect(completed.completedAt).toBeInstanceOf(Date);  // This fails → bug confirmed
 });
 
-// Step 2: Fix the bug
-export async function completeTask(id: string): Promise<Task> {
-  return db.tasks.update(id, {
-    status: 'completed',
-    completedAt: new Date(),  // This was missing
-  });
+// Step 2: Fix the bug in task.service.ts
+async completeTask(id: string): Promise<Task> {
+  const task = await this.taskRepo.findOneOrFail(id);
+  task.status = 'completed';
+  task.completedAt = new Date();  // This was missing
+  await this.taskRepo.flush();
+  return task;
 }
 
 // Step 3: Test passes → bug fixed, regression guarded
@@ -178,18 +211,28 @@ Is it a critical user flow that must work end-to-end?
 Assert on the *outcome* of an operation, not on which methods were called internally. Tests that verify method call sequences break when you refactor, even if the behavior is unchanged.
 
 ```typescript
-// Good: Tests what the function does (state-based)
+// Good: Tests what the function does (state-based) - NestJS + MikroORM
 it('returns tasks sorted by creation date, newest first', async () => {
-  const tasks = await listTasks({ sortBy: 'createdAt', sortOrder: 'desc' });
+  // Arrange: Create test data using MikroORM
+  const task1 = orm.em.create(Task, { title: 'Old', createdAt: new Date('2025-01-01') });
+  const task2 = orm.em.create(Task, { title: 'New', createdAt: new Date('2025-01-02') });
+  await orm.em.flush();
+
+  // Act
+  const tasks = await service.listTasks({ sortBy: 'createdAt', sortOrder: 'desc' });
+
+  // Assert
   expect(tasks[0].createdAt.getTime())
     .toBeGreaterThan(tasks[1].createdAt.getTime());
 });
 
 // Bad: Tests how the function works internally (interaction-based)
-it('calls db.query with ORDER BY created_at DESC', async () => {
-  await listTasks({ sortBy: 'createdAt', sortOrder: 'desc' });
-  expect(db.query).toHaveBeenCalledWith(
-    expect.stringContaining('ORDER BY created_at DESC')
+it('calls em.find with ORDER BY created_at DESC', async () => {
+  await service.listTasks({ sortBy: 'createdAt', sortOrder: 'desc' });
+  expect(orm.em.find).toHaveBeenCalledWith(
+    Task,
+    expect.anything(),
+    expect.objectContaining({ orderBy: { createdAt: 'desc' } })
   );
 });
 ```

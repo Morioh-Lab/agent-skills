@@ -120,33 +120,45 @@ Common bottlenecks by category:
 
 ### Step 3: Fix Common Anti-Patterns
 
-#### N+1 Queries (Backend)
+#### N+1 Queries (Backend - MikroORM)
 
 ```typescript
 // BAD: N+1 — one query per task for the owner
-const tasks = await db.tasks.findMany();
+const tasks = await em.find(Task, {});
 for (const task of tasks) {
-  task.owner = await db.users.findUnique({ where: { id: task.ownerId } });
+  const owner = await em.findOne(User, task.ownerId);  // N+1 problem!
+  task.owner = owner;
 }
 
-// GOOD: Single query with join/include
-const tasks = await db.tasks.findMany({
-  include: { owner: true },
+// GOOD: Single query with populate (MikroORM eager loading)
+const tasks = await em.find(Task, {}, {
+  populate: ['owner'],  // Eagerly load related entities
 });
+
+// Or use joinAndSelect for more control
+const tasks = await em.createQueryBuilder(Task, 't')
+  .leftJoinAndSelect('t.owner', 'o')
+  .getResult();
 ```
 
-#### Unbounded Data Fetching
+#### Unbounded Data Fetching (MongoDB with MikroORM)
 
 ```typescript
-// BAD: Fetching all records
-const allTasks = await db.tasks.findMany();
+// BAD: Fetching all records (dangerous with MongoDB!)
+const allTasks = await em.find(Task, {});
 
-// GOOD: Paginated with limits
-const tasks = await db.tasks.findMany({
-  take: 20,
-  skip: (page - 1) * 20,
+// GOOD: Paginated with limits (always use limit/offset in MongoDB)
+const tasks = await em.find(Task, {}, {
+  limit: 20,
+  offset: (page - 1) * 20,
   orderBy: { createdAt: 'desc' },
 });
+
+// MongoDB-specific: Use indexes for frequently queried fields
+// In entity definition:
+@Index({ properties: ['createdAt', 'status'] })
+@Entity()
+export class Task { ... }
 ```
 
 #### Missing Image Optimization (Frontend)
@@ -262,32 +274,52 @@ function App() {
 }
 ```
 
-#### Missing Caching (Backend)
+#### Missing Caching (Backend - NestJS + MongoDB)
 
 ```typescript
-// Cache frequently-read, rarely-changed data
-const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
-let cachedConfig: AppConfig | null = null;
-let cacheExpiry = 0;
+// NestJS: Use cache-manager with Redis for distributed caching
+import { CacheInterceptor, CacheKey, CacheTTL } from '@nestjs/cache-manager';
+import { UseInterceptors } from '@nestjs/common';
 
-async function getAppConfig(): Promise<AppConfig> {
-  if (cachedConfig && Date.now() < cacheExpiry) {
-    return cachedConfig;
-  }
-  cachedConfig = await db.config.findFirst();
-  cacheExpiry = Date.now() + CACHE_TTL;
-  return cachedConfig;
+@UseInterceptors(CacheInterceptor)
+@Get('config')
+@CacheKey('app-config')
+@CacheTTL(300) // 5 minutes
+async getAppConfig(): Promise<AppConfig> {
+  return this.configService.findOne();
 }
 
-// HTTP caching headers for static assets
-app.use('/static', express.static('public', {
-  maxAge: '1y',           // Cache for 1 year
-  immutable: true,        // Never revalidate (use content hashing in filenames)
-}));
+// Manual caching with Redis (for more control)
+@Injectable()
+export class ConfigService {
+  constructor(
+    @InjectRepository(Config)
+    private readonly configRepo: EntityRepository<Config>,
+    @Inject(CACHE_MANAGER) private cacheManager: Cache,
+  ) {}
 
-// Cache-Control for API responses
-res.set('Cache-Control', 'public, max-age=300'); // 5 minutes
+  async getAppConfig(): Promise<AppConfig> {
+    // Try cache first
+    const cached = await this.cacheManager.get<AppConfig>("app-config");
+    if (cached) return cached;
+
+    // Fetch from MongoDB
+    const config = await this.configRepo.findOne({});
+    
+    // Cache for 5 minutes
+    await this.cacheManager.set("app-config", config, 300000);
+    return config;
+  }
+}
+
+// MongoDB-specific: Use query hints and covered queries
+// Create indexes in migration or entity:
+@Index({ properties: ["status"], options: { sparse: true } })
+@Index({ properties: ["createdAt", "status"] })
+@Entity()
+export class Task { ... }
 ```
+
 
 ## Performance Budget
 
