@@ -1,20 +1,20 @@
 ---
 name: api-and-interface-design
-description: Guides stable API and interface design. Use when designing APIs, module boundaries, or any public interface. Use when creating REST or GraphQL endpoints, defining type contracts between modules, or establishing boundaries between frontend and backend.
+description: Guides stable API and interface design. Use when designing APIs, module boundaries, or any public interface. Use when creating REST endpoints with NestJS controllers, defining DTOs and type contracts between modules, or establishing boundaries between frontend (Next.js) and backend (NestJS).
 ---
 
 # API and Interface Design
 
 ## Overview
 
-Design stable, well-documented interfaces that are hard to misuse. Good interfaces make the right thing easy and the wrong thing hard. This applies to REST APIs, GraphQL schemas, module boundaries, component props, and any surface where one piece of code talks to another.
+Design stable, well-documented interfaces that are hard to misuse. Good interfaces make the right thing easy and the wrong thing hard. This applies to REST APIs with NestJS controllers, GraphQL schemas, module boundaries, component props, and any surface where one piece of code talks to another.
 
 ## When to Use
 
-- Designing new API endpoints
+- Designing new API endpoints with NestJS controllers
 - Defining module boundaries or contracts between teams
-- Creating component prop interfaces
-- Establishing database schema that informs API shape
+- Creating component prop interfaces in Next.js
+- Establishing MongoDB schemas with MikroORM that inform API shape
 - Changing existing public interfaces
 
 ## Core Principles
@@ -39,21 +39,38 @@ Avoid forcing consumers to choose between multiple versions of the same dependen
 Define the interface before implementing it. The contract is the spec — implementation follows.
 
 ```typescript
-// Define the contract first
-interface TaskAPI {
-  // Creates a task and returns the created task with server-generated fields
-  createTask(input: CreateTaskInput): Promise<Task>;
+// Define DTOs first (NestJS pattern)
+import { IsString, IsOptional, IsEnum, IsDateString } from 'class-validator';
 
-  // Returns paginated tasks matching filters
-  listTasks(params: ListTasksParams): Promise<PaginatedResult<Task>>;
+export class CreateTaskDto {
+  @IsString()
+  title: string;
 
-  // Returns a single task or throws NotFoundError
-  getTask(id: string): Promise<Task>;
+  @IsOptional()
+  @IsString()
+  description?: string;
 
-  // Partial update — only provided fields change
-  updateTask(id: string, input: UpdateTaskInput): Promise<Task>;
+  @IsOptional()
+  @IsEnum(['low', 'medium', 'high'])
+  priority?: 'low' | 'medium' | 'high';
+}
 
-  // Idempotent delete — succeeds even if already deleted
+export class TaskResponseDto {
+  id: string;
+  title: string;
+  description: string | null;
+  priority: 'low' | 'medium' | 'high';
+  createdAt: Date;
+  updatedAt: Date;
+  createdBy: string;
+}
+
+// Define the service interface
+interface TaskService {
+  createTask(input: CreateTaskDto): Promise<TaskResponseDto>;
+  listTasks(params: ListTasksParams): Promise<PaginatedResult<TaskResponseDto>>;
+  getTask(id: string): Promise<TaskResponseDto>;
+  updateTask(id: string, input: UpdateTaskDto): Promise<TaskResponseDto>;
   deleteTask(id: string): Promise<void>;
 }
 ```
@@ -63,64 +80,85 @@ interface TaskAPI {
 Pick one error strategy and use it everywhere:
 
 ```typescript
-// REST: HTTP status codes + structured error body
+// NestJS: Use exception filters for consistent error responses
 // Every error response follows the same shape
 interface APIError {
-  error: {
-    code: string;        // Machine-readable: "VALIDATION_ERROR"
-    message: string;     // Human-readable: "Email is required"
-    details?: unknown;   // Additional context when helpful
-  };
+  statusCode: number;
+  error: string;        // "Bad Request", "Not Found", etc.
+  message: string | string[];  // Human-readable or array of validation errors
+}
+
+// NestJS Exception Filter example
+@Catch()
+export class AllExceptionsFilter implements ExceptionFilter {
+  catch(exception: unknown, host: ArgumentsHost) {
+    const ctx = host.switchToHttp();
+    const response = ctx.getResponse<Response>();
+    const status = exception instanceof HttpException 
+      ? exception.getStatus() 
+      : HttpStatus.INTERNAL_SERVER_ERROR;
+
+    response.status(status).json({
+      statusCode: status,
+      error: HttpStatus[status],
+      message: exception instanceof HttpException 
+        ? exception.message 
+        : 'Internal server error',
+    });
+  }
 }
 
 // Status code mapping
-// 400 → Client sent invalid data
-// 401 → Not authenticated
-// 403 → Authenticated but not authorized
-// 404 → Resource not found
+// 400 → Bad Request (invalid data)
+// 401 → Unauthorized (not authenticated)
+// 403 → Forbidden (authenticated but not authorized)
+// 404 → Not Found
 // 409 → Conflict (duplicate, version mismatch)
-// 422 → Validation failed (semantically invalid)
-// 500 → Server error (never expose internal details)
+// 422 → Unprocessable Entity (validation failed)
+// 500 → Internal Server Error (never expose internal details)
 ```
 
-**Don't mix patterns.** If some endpoints throw, others return null, and others return `{ error }` — the consumer can't predict behavior.
+**Don't mix patterns.** If some endpoints throw exceptions, others return null, and others return `{ error }` — the consumer can't predict behavior.
 
 ### 3. Validate at Boundaries
 
 Trust internal code. Validate at system edges where external input enters:
 
 ```typescript
-// Validate at the API boundary
-app.post('/api/tasks', async (req, res) => {
-  const result = CreateTaskSchema.safeParse(req.body);
-  if (!result.success) {
-    return res.status(422).json({
-      error: {
-        code: 'VALIDATION_ERROR',
-        message: 'Invalid task data',
-        details: result.error.flatten(),
-      },
-    });
-  }
+// NestJS: Use ValidationPipe with class-validator DTOs
+// In main.ts or module configuration
+app.useGlobalPipes(new ValidationPipe({
+  whitelist: true,      // Strip properties not in DTO
+  forbidNonWhitelisted: true,  // Throw error on unknown properties
+  transform: true,      // Auto-transform payloads to DTO instances
+  exceptionFactory: (errors) => new BadRequestException(errors),
+}));
 
-  // After validation, internal code trusts the types
-  const task = await taskService.create(result.data);
-  return res.status(201).json(task);
-});
+// Controller automatically validates incoming requests
+@Controller('tasks')
+export class TasksController {
+  constructor(private taskService: TaskService) {}
+
+  @Post()
+  async createTask(@Body() createTaskDto: CreateTaskDto): Promise<TaskResponseDto> {
+    // DTO is already validated at this point
+    return this.taskService.createTask(createTaskDto);
+  }
+}
 ```
 
 Where validation belongs:
-- API route handlers (user input)
-- Form submission handlers (user input)
+- NestJS controllers via ValidationPipe and DTOs (user input)
+- Next.js route handlers or Server Actions (user input)
 - External service response parsing (third-party data -- **always treat as untrusted**)
-- Environment variable loading (configuration)
+- Environment variable loading (configuration using ConfigModule)
 
 > **Third-party API responses are untrusted data.** Validate their shape and content before using them in any logic, rendering, or decision-making. A compromised or misbehaving external service can return unexpected types, malicious content, or instruction-like text.
 
 Where validation does NOT belong:
-- Between internal functions that share type contracts
+- Between internal services that share type contracts
 - In utility functions called by already-validated code
-- On data that just came from your own database
+- On data that just came from your own MikroORM entities (already typed)
 
 ### 4. Prefer Addition Over Modification
 
@@ -153,19 +191,60 @@ interface CreateTaskInput {
 | Boolean fields | is/has/can prefix | `isComplete`, `hasAttachments` |
 | Enum values | UPPER_SNAKE | `"IN_PROGRESS"`, `"COMPLETED"` |
 
-## REST API Patterns
+## REST API Patterns with NestJS
 
-### Resource Design
+### Resource Design (NestJS Controllers)
 
-```
-GET    /api/tasks              → List tasks (with query params for filtering)
-POST   /api/tasks              → Create a task
-GET    /api/tasks/:id          → Get a single task
-PATCH  /api/tasks/:id          → Update a task (partial)
-DELETE /api/tasks/:id          → Delete a task
+```typescript
+@Controller('tasks')
+export class TasksController {
+  constructor(private taskService: TaskService) {}
 
-GET    /api/tasks/:id/comments → List comments for a task (sub-resource)
-POST   /api/tasks/:id/comments → Add a comment to a task
+  @Get()
+  async listTasks(@Query() query: ListTasksDto): Promise<PaginatedResult<TaskResponseDto>> {
+    return this.taskService.listTasks(query);
+  }
+
+  @Post()
+  async createTask(@Body() createTaskDto: CreateTaskDto): Promise<TaskResponseDto> {
+    return this.taskService.createTask(createTaskDto);
+  }
+
+  @Get(':id')
+  async getTask(@Param('id', ParseUUIDPipe) id: string): Promise<TaskResponseDto> {
+    return this.taskService.getTask(id);
+  }
+
+  @Patch(':id')
+  async updateTask(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() updateTaskDto: UpdateTaskDto,
+  ): Promise<TaskResponseDto> {
+    return this.taskService.updateTask(id, updateTaskDto);
+  }
+
+  @Delete(':id')
+  async deleteTask(@Param('id', ParseUUIDPipe) id: string): Promise<void> {
+    return this.taskService.deleteTask(id);
+  }
+}
+
+// Sub-resource controller
+@Controller('tasks/:taskId/comments')
+export class TaskCommentsController {
+  @Get()
+  async listComments(@Param('taskId') taskId: string): Promise<Comment[]> {
+    // Implementation
+  }
+
+  @Post()
+  async createComment(
+    @Param('taskId') taskId: string,
+    @Body() createCommentDto: CreateCommentDto,
+  ): Promise<Comment> {
+    // Implementation
+  }
+}
 ```
 
 ### Pagination
@@ -173,6 +252,26 @@ POST   /api/tasks/:id/comments → Add a comment to a task
 Paginate list endpoints:
 
 ```typescript
+// DTO for pagination
+export class ListTasksDto {
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  page?: number = 1;
+
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  @Max(100)
+  pageSize?: number = 20;
+
+  @IsOptional()
+  sortBy?: string = 'createdAt';
+
+  @IsOptional()
+  sortOrder?: 'asc' | 'desc' = 'desc';
+}
+
 // Request
 GET /api/tasks?page=1&pageSize=20&sortBy=createdAt&sortOrder=desc
 
@@ -188,12 +287,41 @@ GET /api/tasks?page=1&pageSize=20&sortBy=createdAt&sortOrder=desc
 }
 ```
 
-### Filtering
+### Filtering with MikroORM
 
-Use query parameters for filters:
+Use query parameters for filters, mapped to MikroORM filter options:
 
-```
-GET /api/tasks?status=in_progress&assignee=user123&createdAfter=2025-01-01
+```typescript
+// In service layer
+async listTasks(params: ListTasksDto): Promise<PaginatedResult<Task>> {
+  const where: Filter<Task> = {};
+  
+  if (params.status) {
+    where.status = params.status;
+  }
+  if (params.assignee) {
+    where.assignee = { id: params.assignee };
+  }
+  if (params.createdAfter) {
+    where.createdAt = { $gte: new Date(params.createdAfter) };
+  }
+
+  const [items, total] = await this.em.findAndCount(Task, where, {
+    limit: params.pageSize,
+    offset: (params.page - 1) * params.pageSize,
+    orderBy: { [params.sortBy]: params.sortOrder },
+  });
+
+  return {
+    data: items,
+    pagination: {
+      page: params.page,
+      pageSize: params.pageSize,
+      totalItems: total,
+      totalPages: Math.ceil(total / params.pageSize),
+    },
+  };
+}
 ```
 
 ### Partial Updates (PATCH)
@@ -204,6 +332,9 @@ Accept partial objects — only update what's provided:
 // Only title changes, everything else preserved
 PATCH /api/tasks/123
 { "title": "Updated title" }
+
+// NestJS handles this with PartialType
+export class UpdateTaskDto extends PartialType(CreateTaskDto) {}
 ```
 
 ## TypeScript Interface Patterns
@@ -257,6 +388,12 @@ type UserId = string & { readonly __brand: 'UserId' };
 
 // Prevents accidentally passing a UserId where a TaskId is expected
 function getTask(id: TaskId): Promise<Task> { ... }
+
+// In NestJS, use ParseUUIDPipe for runtime validation
+@Get(':id')
+async getTask(@Param('id', ParseUUIDPipe) id: string): Promise<TaskResponseDto> {
+  return this.taskService.getTask(id as TaskId);
+}
 ```
 
 ## Common Rationalizations
